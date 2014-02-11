@@ -1,7 +1,10 @@
-/*
+/**
  * Author: sthomas@optionshouse.com
  * Created at: Thu Jan 16 14:59:03 -0600 2014
  *
+ * Basic shard API:
+ *  - Each shard gets its own ID generator.
+ *  - Optimized shard 'nextval' function.
  */
 
 \echo Use "CREATE EXTENSION shard_manager;" to load this file. \quit
@@ -21,15 +24,18 @@ SET LOCAL search_path TO @extschema@;
  * for the user who created the shard_manager extension to hand management
  * to other users. Functions for this include:
  *
- * - create_next_shard
- * - init_shard_tables
- * - register_base_table
- * - unregister_base_table
+ *  - create_next_shard
+ *  - create_id_function
+ *  - init_shard_tables
+ *  - register_base_table
+ *  - set_shard_config
+ *  - unregister_base_table
  *
  * Table select permission includes:
  *
- * - shard_table
- * - shard_map
+ *  - shard_config
+ *  - shard_table
+ *  - shard_map
  *
  * We suggest using a role for "admin" class users to avoid micromanagement.
  *
@@ -49,6 +55,11 @@ BEGIN
 
   EXECUTE '
   GRANT EXECUTE
+     ON FUNCTION @extschema@.create_id_function()
+     TO ' || quote_ident(db_role);
+
+  EXECUTE '
+  GRANT EXECUTE
      ON FUNCTION @extschema@.init_shard_tables(VARCHAR, INT)
      TO ' || quote_ident(db_role);
 
@@ -59,7 +70,17 @@ BEGIN
 
   EXECUTE '
   GRANT EXECUTE
+     ON FUNCTION @extschema@.set_shard_config(VARCHAR, VARCHAR)
+     TO ' || quote_ident(db_role);
+
+  EXECUTE '
+  GRANT EXECUTE
      ON FUNCTION @extschema@.unregister_base_table(VARCHAR, VARCHAR)
+     TO ' || quote_ident(db_role);
+
+  EXECUTE '
+  GRANT SELECT
+     ON TABLE @extschema@.shard_config
      TO ' || quote_ident(db_role);
 
   EXECUTE '
@@ -77,6 +98,91 @@ $$ LANGUAGE PLPGSQL SECURITY DEFINER;
 
 
 /**
+ * Create the next_unique_id Function Based on shard_manager Settings
+ *
+ * After being created, the shard_manager extension needs a function to
+ * generate unique IDs. There are three settings in shard_config that
+ * control how this works:
+ *
+ *   - epoch : The date (and optional time) when IDs begin. This is 
+ *       converted to the number of milliseconds since 1970 so we can safely
+ *       subtract it from the current time as represented in milliseconds.
+ *       This is how we know each ID is unique per ms.
+ *   - shard_count : The number of shards shard_manager is currently
+ *       configured to generate IDs for.
+ *   - ids_per_ms : The number of IDs that may be generated per millisecond,
+ *       per shard.
+ *
+ * This function should be called any time adjustments are made to any of
+ * the above settings.
+ */
+CREATE OR REPLACE FUNCTION create_id_function()
+RETURNS TEXT AS $$
+DECLARE
+
+  epoch       TIMESTAMP WITHOUT TIME ZONE;
+  shards      INT;
+  ids         INT;
+  epoch_ms    BIGINT;
+  shard_bits  INT;
+  id_bits     INT;
+  used_bits   INT;
+  date_bits   INT;
+  date_end    TIMESTAMP WITHOUT TIME ZONE;
+
+BEGIN
+
+  -- Fetch settings from the config table. We only use the three that
+  -- actually control ID generation: epoch, shard_count, and ids_per_ms.
+  
+  epoch = @extschema@.get_shard_config('epoch');
+  shards = @extschema@.get_shard_config('shard_count');
+  ids = @extschema@.get_shard_config('ids_per_ms');
+
+  -- Perform a few calculations, and make sure nobody tried to override 
+  -- safeguards on shard count or the number of IDs per ms.
+
+  epoch_ms = floor(extract(EPOCH FROM epoch) * 1000);
+  shard_bits = floor(log(shards) / log(2));
+  id_bits = floor(log(ids) / log(2));
+  used_bits = shard_bits + id_bits;
+  date_bits = 64 - used_bits;
+  date_end = epoch + (floor(2^date_bits / 3600000) || ' h')::INTERVAL;
+
+  -- Create the next_unique_id function. At this point, we have calculated
+  -- all of our bit-shifts, so we can declare the function as SQL with no
+  -- excess calculations or polls into the configuration table. This should
+  -- make it extremely fast.
+
+  EXECUTE $NEXTVAL$
+    CREATE OR REPLACE FUNCTION @extschema@.next_unique_id(
+      schema_name VARCHAR,
+      shard_id INT
+    )
+    RETURNS BIGINT AS $UNIQUE$
+      SELECT (
+               (floor(extract(EPOCH FROM clock_timestamp()) * 1000)::BIGINT -
+                $NEXTVAL$ || epoch_ms || $NEXTVAL$
+               ) << $NEXTVAL$ || used_bits || $NEXTVAL$ |
+               ($2 << $NEXTVAL$ || shard_bits || $NEXTVAL$) |
+               (nextval($1 || $2 || '.table_id_seq') % 
+               $NEXTVAL$ || id_bits || $NEXTVAL$)
+             )::BIGINT;
+    $UNIQUE$ LANGUAGE SQL SECURITY DEFINER;
+  $NEXTVAL$;
+
+  -- Tell the caller about our adjustments, and when the shard manager will
+  -- cease returning unique shard IDs.
+
+  RETURN 'Assuming ' || 2^id_bits || ' IDs per ms on ' ||
+    2^shard_bits || ' shards, Shard Manager will produce ' ||
+    'unique values until ' || to_char(date_end, 'YYYY-MM-DD HH:MI:SS');
+
+END;
+$$ LANGUAGE plpgsql SECURITY DEFINER;
+
+
+/**
  * Create the Next Logical Shard for a Named Schema
  *
  * Given a schema name and server name, this function will create and
@@ -85,10 +191,10 @@ $$ LANGUAGE PLPGSQL SECURITY DEFINER;
  * container will only contain a single sequence, used as a global
  * increment counter used to generate non-colliding serial between shards.
  *
- * Schemas can have up to 2048 shards each. Every shard is named after
- * the source schema with a number appended. The number is always sequential
- * following the last existing shard, as to maximize the number of shards
- * created under a 2^11 mask.
+ * Schemas can have up to shard_config.shard_count shards each. Every shard
+ * is named after the source schema with a number appended. The number is
+ * always sequential following the last existing shard, as to maximize the
+ * number of shards created under a bitmask.
  *
  * @param schema_name String name of the schema that is the root for this
  *   shard. For instance, to shard the 'foo' schema into foo1, foo2,
@@ -104,12 +210,20 @@ CREATE OR REPLACE FUNCTION create_next_shard(
 RETURNS VOID AS
 $$
 DECLARE
-  next_shard INT;
+  next_shard   INT;
+  shard_count  INT;
 BEGIN
+
+  -- Obtain the value for shard count so we can impose a shard maximum.
+
+  SELECT INTO shard_max setting::INT
+    FROM @extschema@.shard_config
+   WHERE config_name = 'shard_count';
 
   -- Get the currently "top" shard. Due to bit packing, we never want to
   -- skip IDs. If a schema has no shards yet, this is the first shard.
-  -- Also, no schema can have more than 2048 shards thanks to our bitmask.
+  -- Also, no schema can have more than shard_count shards thanks to our
+  -- bitmask.
 
   SELECT INTO next_shard shard_id + 1
     FROM @extschema@.shard_map
@@ -121,7 +235,7 @@ BEGIN
     next_shard = 1;
   END IF;
 
-  IF next_shard > 2048 THEN
+  IF next_shard > shard_count - 1 THEN
     RAISE EXCEPTION 'Maximum shards reached for % schema', schema_name;
   END IF;
 
@@ -151,15 +265,18 @@ $$ LANGUAGE PLPGSQL SECURITY DEFINER;
  * will remove a user or role from the list of those allowed to invoke shard
  * management routines. Functions permissions removed:
  *
- * - create_next_shard
- * - init_shard_tables
- * - register_base_table
- * - unregister_base_table
+ *  - create_next_shard
+ *  - create_id_function
+ *  - init_shard_tables
+ *  - register_base_table
+ *  - set_shard_config
+ *  - unregister_base_table
  *
  * Table select permission removed:
  *
- * - shard_table
- * - shard_map
+ *  - shard_config
+ *  - shard_table
+ *  - shard_map
  *
  * @param db_role  String user or role to remove as shard admin.
  */
@@ -177,6 +294,11 @@ BEGIN
 
   EXECUTE '
   REVOKE EXECUTE
+      ON FUNCTION @extschema@.create_id_function()
+    FROM ' || quote_ident(db_role);
+
+  EXECUTE '
+  REVOKE EXECUTE
       ON FUNCTION @extschema@.init_shard_tables(VARCHAR, INT)
     FROM ' || quote_ident(db_role);
 
@@ -187,7 +309,17 @@ BEGIN
 
   EXECUTE '
   REVOKE EXECUTE
+      ON FUNCTION @extschema@.set_shard_config(VARCHAR, VARCHAR)
+    FROM ' || quote_ident(db_role);
+
+  EXECUTE '
+  REVOKE EXECUTE
       ON FUNCTION @extschema@.unregister_base_table(VARCHAR, VARCHAR)
+    FROM ' || quote_ident(db_role);
+
+  EXECUTE '
+  REVOKE ALL
+      ON TABLE @extschema@.shard_config
     FROM ' || quote_ident(db_role);
 
   EXECUTE '
@@ -200,6 +332,26 @@ BEGIN
       ON TABLE @extschema@.shard_table
     FROM ' || quote_ident(db_role);
 
+END;
+$$ LANGUAGE PLPGSQL SECURITY DEFINER;
+
+
+/**
+ * Retrieve a Configuration Setting from shard_config.
+ *
+ * @param config_key  Name of the configuration setting to retrieve.
+ *
+ * @return TEXT  Value for the requested configuration setting.
+ */
+CREATE OR REPLACE FUNCTION get_shard_config(
+  config_key  VARCHAR
+)
+RETURNS TEXT AS
+$$
+BEGIN
+  RETURN (SELECT setting
+    FROM @extschema@.shard_config
+   WHERE config_name = config_key);
 END;
 $$ LANGUAGE PLPGSQL SECURITY DEFINER;
 
@@ -270,8 +422,8 @@ BEGIN
 
     EXECUTE
       'ALTER TABLE ' || new_table || ' ' ||
-      'ALTER COLUMN ' || col_name || '  SET ' ||
-      'DEFAULT @extschema@.next_unique_id(' ||
+      'ALTER ' || col_name || ' TYPE BIGINT, ' ||
+      'ALTER ' || col_name || ' SET DEFAULT @extschema@.next_unique_id(' ||
       quote_literal(schema_source) || ',' || shard_number || ')';
   END LOOP;
 
@@ -316,15 +468,18 @@ $$ LANGUAGE PLPGSQL SECURITY DEFINER;
  * To ensure IDs generated by this function remain unique across all shards,
  * we apply the following techniques:
  *
- *   - Epoch is defined as the number of milliseconds at 2013-01-01.
- *   - clock_timestamp gets the currently defined epoch in milliseconds.
- *   - The difference between these two is the first 42 bits of our ID.
- *   - The shard ID (max 2048) is bit-shifted by 11 places (2048).
- *   - The schema-specific sequence provides the final 2048 counter.
+ *   - Epoch is defined as milliseconds from UNIX epoch in shard_config.
+ *   - clock_timestamp gets the current epoch in milliseconds.
+ *   - The difference between these two become the first bits of our ID.
+ *   - Shard ID is bit-shifted by log2(ids_per_ms) from shard_config.
+ *   - A shard-specific sequence ID is retrieved.
  *   - All three numbers are ORd together to obtain a shard dependent value.
  *
- * This can generate up to 2048 sequential values per shard, per millisecond,
- * for 138 years.
+ * Depending on the bit distribution between epoch, shard_count, and
+ * ids_per_ms, we can potentially generate unique IDs for hundreds of years.
+ *
+ * NOTE: This is a stub function, to keep permissions organized. The function
+ *       itself is defined by create_id_function.
  *
  * @param schema_name String name of the schema that is the root for this
  *   shard. I.e. for foo1...fooN, use foo.
@@ -336,14 +491,83 @@ CREATE OR REPLACE FUNCTION next_unique_id(
   shard_id INT
 )
 RETURNS BIGINT AS $$
-  SELECT (
-           (FLOOR(EXTRACT(EPOCH FROM clock_timestamp()) * 1000)::BIGINT -
-            1357020000000::BIGINT -- Epoch (January 1, 2013)
-           ) << 22 |
-           ($2 << 11) | -- Mod by 2048 shards
-           (nextval($1 || $2 || '.table_id_seq') % 2048)
-         )::BIGINT;
+  SELECT NULL;
 $$ LANGUAGE SQL SECURITY DEFINER;
+
+
+/**
+ * Set a Configuration Setting from shard_config.
+ *
+ * This function doesn't just set values. It also acts as an API for
+ * checking setting validity. These settings are specifically adjusted:
+ *
+ *  - epoch : Must be a valid date + optional time.
+ *  - ids_per_ms : Will be rounded to the next lowest power of two.
+ *      If an even power of two is set, nothing is changed.
+ *  - shard_count : Will be rounded to the next lowest power of two.
+ *      If an even power of two is set, nothing is changed.
+ *
+ * All settings will be folded to lower case for consistency.
+ *
+ * @param config_key  Name of the configuration setting to retrieve.
+ * @param config_val  full value to use for the specified setting.
+ *
+ * @return TEXT  Value for the created/modified configuration setting.
+ */
+CREATE OR REPLACE FUNCTION set_shard_config(
+  config_key  VARCHAR,
+  config_val  VARCHAR
+)
+RETURNS TEXT AS
+$$
+DECLARE
+  new_val  VARCHAR := config_val;
+  low_key  VARCHAR := lower(config_key);
+BEGIN
+  -- If this is a new setting we don't control, just set it and ignore it.
+  -- The admin may be storing personal notes. Any settings required by the
+  -- extension should already exist by this point.
+
+  PERFORM 1 FROM @extschema@.shard_config WHERE config_name = low_key;
+  
+  IF NOT FOUND THEN
+    INSERT INTO @extschema@.shard_config (config_name, setting)
+    VALUES (low_key, new_val);
+
+    RETURN new_val;
+  END IF;
+
+  -- Apply our filter to any setting that we recognize.
+
+  IF low_key = 'epoch' THEN
+    BEGIN
+      SELECT config_val::TIMESTAMP WITHOUT TIME ZONE;
+    EXCEPTION
+      WHEN OTHERS THEN
+        RAISE EXCEPTION '% is not a valid date!', config_val;
+        RETURN NULL;
+    END;
+  ELSIF low_key IN ('ids_per_ms', 'shard_count') THEN
+    BEGIN
+      new_val = floor(log(config_val::INT) / log(2));
+    EXCEPTION
+      WHEN OTHERS THEN
+        RAISE EXCEPTION '% must be a number!', config_val;
+        RETURN NULL;
+    END;
+  END IF;
+
+  -- With the data filtered, it's now safe to modify the config table.
+
+  UPDATE @extschema@.shard_config
+     SET setting = new_val,
+         is_default = False
+   WHERE config_name = low_key;
+
+  RETURN new_val;
+
+END;
+$$ LANGUAGE PLPGSQL SECURITY DEFINER;
 
 
 /**
@@ -393,12 +617,12 @@ BEGIN
   -- timestamp is applied to track the last time the row was changed.
 
   IF TG_OP = 'INSERT' THEN
-    NEW.created_dt = NOW();
+    NEW.created_dt = now();
   ELSE
     NEW.created_dt = OLD.created_dt;
   END IF;
 
-  NEW.modified_dt = NOW();
+  NEW.modified_dt = now();
 
   RETURN NEW;
 
@@ -409,9 +633,22 @@ $$ LANGUAGE plpgsql;
 -- CREATE TABLES
 --------------------------------------------------------------------------------
 
--- Basic shard API:
---   * Each shard gets its own ID generator.
---   * Optimized shard 'nextval' function.
+CREATE TABLE shard_config
+(
+  config_id      SERIAL     NOT NULL PRIMARY KEY,
+  config_name    VARCHAR    UNIQUE NOT NULL,
+  setting        VARCHAR    NOT NULL,
+  is_default     BOOLEAN    NOT NULL DEFAULT False,
+  created_dt     TIMESTAMP  NOT NULL DEFAULT now(),
+  modified_dt    TIMESTAMP  NOT NULL DEFAULT now()
+);
+
+SELECT pg_catalog.pg_extension_config_dump('shard_config',
+  'WHERE NOT is_default');
+
+CREATE TRIGGER t_shard_config_timestamp_b_iu
+BEFORE INSERT OR UPDATE ON shard_config
+   FOR EACH ROW EXECUTE PROCEDURE update_audit_stamps();
 
 CREATE TABLE shard_map
 (
@@ -420,12 +657,13 @@ CREATE TABLE shard_map
   source_schema VARCHAR    NOT NULL,
   shard_schema  VARCHAR    NOT NULL,
   server_name   VARCHAR    NOT NULL,
-  created_dt    TIMESTAMP  NOT NULL DEFAULT CURRENT_DATE,
-  modified_dt   TIMESTAMP  NOT NULL DEFAULT CURRENT_DATE,
+  created_dt    TIMESTAMP  NOT NULL DEFAULT now(),
+  modified_dt   TIMESTAMP  NOT NULL DEFAULT now(),
   UNIQUE (shard_id, source_schema)
 );
 
-SELECT pg_catalog.pg_extension_config_dump('shard_map', '');
+SELECT pg_catalog.pg_extension_config_dump('shard_map',
+  'WHERE NOT is_default');
 
 CREATE TRIGGER t_shard_map_timestamp_b_iu
 BEFORE INSERT OR UPDATE ON shard_map
@@ -437,11 +675,12 @@ CREATE TABLE shard_table
   schema_name    VARCHAR    NOT NULL,
   table_name     VARCHAR    NOT NULL,
   id_column      VARCHAR    NOT NULL,
-  created_dt     TIMESTAMP  NOT NULL DEFAULT CURRENT_DATE,
-  modified_dt    TIMESTAMP  NOT NULL DEFAULT CURRENT_DATE
+  created_dt     TIMESTAMP  NOT NULL DEFAULT now(),
+  modified_dt    TIMESTAMP  NOT NULL DEFAULT now()
 );
 
-SELECT pg_catalog.pg_extension_config_dump('shard_table', '');
+SELECT pg_catalog.pg_extension_config_dump('shard_table',
+  'WHERE NOT is_default');
 
 CREATE TRIGGER t_shard_table_timestamp_b_iu
 BEFORE INSERT OR UPDATE ON shard_table
@@ -453,6 +692,10 @@ BEFORE INSERT OR UPDATE ON shard_table
 
 REVOKE EXECUTE
     ON FUNCTION add_shard_admin(VARCHAR)
+  FROM PUBLIC;
+
+REVOKE EXECUTE
+    ON FUNCTION create_id_function()
   FROM PUBLIC;
 
 REVOKE EXECUTE
@@ -476,9 +719,25 @@ REVOKE EXECUTE
   FROM PUBLIC;
 
 REVOKE EXECUTE
+    ON FUNCTION set_shard_config(VARCHAR, VARCHAR)
+  FROM PUBLIC;
+
+REVOKE EXECUTE
     ON FUNCTION unregister_base_table(VARCHAR, VARCHAR)
   FROM PUBLIC;
 
 REVOKE EXECUTE
     ON FUNCTION update_audit_stamps()
   FROM PUBLIC;
+
+--------------------------------------------------------------------------------
+-- CONFIGURE EXTENSION
+--------------------------------------------------------------------------------
+
+INSERT INTO shard_config (config_name, setting, is_default) VALUES
+  ('epoch', CURRENT_DATE, True),
+  ('shard_count', 2048, True),
+  ('ids_per_ms', 2048, True);
+
+SELECT create_id_function();
+

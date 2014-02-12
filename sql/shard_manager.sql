@@ -47,6 +47,10 @@ CREATE OR REPLACE FUNCTION add_shard_admin(
 RETURNS VOID AS
 $$
 BEGIN
+  EXECUTE '
+  GRANT USAGE
+     ON SCHEMA @extschema@
+     TO ' || quote_ident(db_role);
 
   EXECUTE '
   GRANT EXECUTE
@@ -175,7 +179,7 @@ BEGIN
   -- cease returning unique shard IDs.
 
   RETURN 'Assuming ' || 2^id_bits || ' IDs per ms on ' ||
-    2^shard_bits || ' shards, Shard Manager will produce ' ||
+    2^shard_bits || E' shards, Shard Manager\nwill produce ' ||
     'unique values until ' || to_char(date_end, 'YYYY-MM-DD HH:MI:SS');
 
 END;
@@ -216,7 +220,7 @@ BEGIN
 
   -- Obtain the value for shard count so we can impose a shard maximum.
 
-  SELECT INTO shard_max setting::INT
+  SELECT INTO shard_count setting::INT
     FROM @extschema@.shard_config
    WHERE config_name = 'shard_count';
 
@@ -397,7 +401,8 @@ BEGIN
   SELECT INTO shard_name shard_schema
     FROM @extschema@.shard_map
    WHERE source_schema = schema_source
-     AND shard_id = shard_number;
+     AND shard_id = shard_number
+     FOR UPDATE;
 
   IF NOT FOUND THEN
     RAISE EXCEPTION 'Shard % does not exist for schema %!', 
@@ -425,7 +430,17 @@ BEGIN
       'ALTER ' || col_name || ' TYPE BIGINT, ' ||
       'ALTER ' || col_name || ' SET DEFAULT @extschema@.next_unique_id(' ||
       quote_literal(schema_source) || ',' || shard_number || ')';
+
   END LOOP;
+
+  -- At the end, update shard_map to denote that this shard has been
+  -- initialized. If shards are initialized, we have to block certain
+  -- actions.
+  
+  UPDATE @extschema@.shard_map
+     SET initialized = True
+   WHERE source_schema = schema_source
+     AND shard_id = shard_number;
 
 END;
 $$ LANGUAGE PLPGSQL SECURITY DEFINER;
@@ -491,7 +506,7 @@ CREATE OR REPLACE FUNCTION next_unique_id(
   shard_id INT
 )
 RETURNS BIGINT AS $$
-  SELECT NULL;
+  SELECT NULL::BIGINT;
 $$ LANGUAGE SQL SECURITY DEFINER;
 
 
@@ -521,8 +536,11 @@ CREATE OR REPLACE FUNCTION set_shard_config(
 RETURNS TEXT AS
 $$
 DECLARE
-  new_val  VARCHAR := config_val;
-  low_key  VARCHAR := lower(config_key);
+  bit_adj   INT;
+  new_val   VARCHAR := config_val;
+  low_key   VARCHAR := lower(config_key);
+
+  info_msg  VARCHAR;
 BEGIN
   -- If this is a new setting we don't control, just set it and ignore it.
   -- The admin may be storing personal notes. Any settings required by the
@@ -537,6 +555,19 @@ BEGIN
     RETURN new_val;
   END IF;
 
+  -- This check is critical to shard_manager. Never, ever allow any changes
+  -- to shard-related settings if any shards have been initialized.
+
+  IF low_key IN ('epoch', 'ids_per_ms', 'shard_count') THEN
+    PERFORM 1
+       FROM @extschema@.shard_map
+      WHERE initialized;
+
+    IF FOUND THEN
+      RAISE EXCEPTION 'Can not change % setting with active shards.', low_key;
+    END IF;
+  END IF;
+
   -- Apply our filter to any setting that we recognize.
 
   IF low_key = 'epoch' THEN
@@ -549,7 +580,8 @@ BEGIN
     END;
   ELSIF low_key IN ('ids_per_ms', 'shard_count') THEN
     BEGIN
-      new_val = floor(log(config_val::INT) / log(2));
+      bit_adj = floor(log(config_val::INT) / log(2));
+      new_val = 2^bit_adj;
     EXCEPTION
       WHEN OTHERS THEN
         RAISE EXCEPTION '% must be a number!', config_val;
@@ -563,6 +595,16 @@ BEGIN
      SET setting = new_val,
          is_default = False
    WHERE config_name = low_key;
+
+  -- If the setting is recognized at all, execute create_id_function so 
+  -- IDs fit the new bit shift-values and epoch.
+
+  IF low_key IN ('epoch', 'ids_per_ms', 'shard_count') THEN
+    SELECT INTO info_msg @extschema@.create_id_function();
+    RAISE WARNING '%', info_msg;
+  END IF;
+
+  -- Finally, return the value of the setting, indicating it was accepted.
 
   RETURN new_val;
 
@@ -657,6 +699,7 @@ CREATE TABLE shard_map
   source_schema VARCHAR    NOT NULL,
   shard_schema  VARCHAR    NOT NULL,
   server_name   VARCHAR    NOT NULL,
+  initialized   BOOLEAN    NOT NULL DEFAULT False,
   created_dt    TIMESTAMP  NOT NULL DEFAULT now(),
   modified_dt   TIMESTAMP  NOT NULL DEFAULT now(),
   UNIQUE (shard_id, source_schema)

@@ -5,6 +5,7 @@ Shard Manager is an extension designed to bring database sharding to PostgreSQL.
 
 Inspired by Instagram's numerous posts on their sharding algorithm, Shard Manager can potentially generate unique IDs across numerous tables for hundreds of years. In addition, we have included management and deployment functions to simplify shard management.
 
+
 Installation
 ============
 
@@ -14,6 +15,7 @@ To use Shard Manager, it must first be installed. Simply execute these commands 
     CREATE EXTENSION shard_manager WITH SCHEMA shard;
 
 The `shard` schema isn't strictly necessary, but we recommend keeping namespaces isolated.
+
 
 Usage
 =====
@@ -43,7 +45,7 @@ Next, we have to create a new physical shard. Shard Manager uses schemas as shar
 
     SELECT shard.create_next_shard('comm', 'localhost');
 
-The second parameter is set to `localhost` for now, but it's merely a tracking value. We don't currently make use of foreign tables. The idea here, is that the values in the shard.shard_map table can be used as a physical/logical map for application use.
+The second parameter is set to `localhost` for now, but it's merely a tracking value. We don't currently make use of foreign tables. The idea here, is that the values in the `shard.shard_map` table can be used as a physical/logical map for application use.
 
 The next step is to fill our new shard schema. Again, we have a helper function for this:
 
@@ -63,12 +65,62 @@ That ID is huge! But in this case, that's expected. We use all of a 64-bit integ
 
 This is all handled automatically to encourage shard use.
 
+
 Configuration
 =============
+
+Configuring Shard Manager has been simplified by the introduction of two functions designed to handle setting validation and other internals. To see all settings at once, execute this query to examine the contents of the `shard_config` table.
+
+    SELECT config_name, setting FROM shard.shard_config;
+
+Shard manager should produce several fields it sets by default:
+
+     config_name |  setting   
+    -------------+------------
+     epoch       | 2014-02-11
+     shard_count | 2048
+     ids_per_ms  | 2048
+
+In this case, Shard Manager was installed on 2014-02-11, and can handle up to 2048 shards, with 2048 IDs per shard, per millisecond. That's over two million IDs per second, *per shard*. All modifications to these settings must take place before calling `init_shard_tables`. This helps protect any existing ID values from collision due to changed ID generation assumptions.
+
+To change settings, use the `set_shard_config` function as seen here:
+
+    SELECT shard.set_shard_config('shard_count', '1000');
+
+The output is actually important in this case:
+
+    WARNING:  Assuming 2048 IDs per ms on 512 shards, Shard Manager 
+    will produce unique values until 2571-08-04 06:00:00
+     set_shard_config 
+    ------------------
+     512
+
+Notice how Shard Manager automatically adjusted the number of shards to the next lowest valid power of two. Since it uses a 64-bit integer internally, it must ensure lossless conversion. The warning is mainly a notice to inform any user that changes watched settings of Shard Manager's current capabilities. Again, we strongly recommend experimenting with various settings *before* creating new shards. Changes can not be made to system settings following shard initialization!
 
 
 Tables
 ======
+
+Shard Manager has a few tables that provide information about its operation and configuration. These tables include:
+
+Table Name | Description
+--- | ---
+shard_config | Contains all settings Shard Manager uses to control shard allocation.
+shard_map | Maintains a physical/logical mapping for applications to find shards. Tracks whether shards have been initialized for use.
+shard_table | Master resource where all registered shard tables are tracked. Every schema can have its own list of tables.
+
+
+Security
+========
+
+Due to its low-level operation, Shard Manager works best when executed by a database superuser. However, we understand this is undesirable in many cases. Certain Shard Manager capabilities can be assigned to other users by calling `add_shard_admin`. For example:
+
+    CREATE USER shard_user;
+    SELECT shard.add_shard_admin('shard_user');
+
+This user can now call any of the shard management functions. These functions should always work, provided the user who created the `shard_manager` extension was a superuser. To revoke access, call the analog function:
+
+    SELECT shard.drop_shard_admin('shard_user');
 
 
 Build Instructions
@@ -114,3 +166,14 @@ Copyright and License
 
 Copyright (c) 2014 Peak6
 
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.

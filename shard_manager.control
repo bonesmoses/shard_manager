@@ -1,0 +1,4 @@
+# shard_manager extension
+comment = 'Extension for managing schema-based horizontal scaling.'
+default_version = '0.0.1'
+relocatable = false

@@ -1,0 +1,24 @@
+{
+    "name": "shard_manager",
+    "abstract": "Extension for managing schema-based horizontal scaling.",
+    "description": "The shard_manager extension seeks to add shard management to PostgreSQL. Shards built by this package follow various schemas; each schema clone is a fully self-contained relocatable structure.",
+    "version": "0.0.1",
+    "maintainer": "sthomas@optionshouse.com",
+    "license": "Apache",
+    "provides": {
+        "shard_manager": {
+            "abstract": "Extension for managing schema-based horizontal scaling",
+            "file": "sql/shard_manager.sql",
+            "docfile": "doc/shard_manager.md",
+            "version": "0.0.1"
+        }
+    },
+    "release_status": "unstable",
+
+    "generated_by": "sthomas@optionshouse.com",
+
+    "meta-spec": {
+        "version": "1.0.0",
+        "url": "http://pgxn.org/meta/spec.txt"
+    }
+}
